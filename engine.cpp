@@ -42,7 +42,7 @@ bool Engine::build(std::string onnxModelPath) {
 
     // Set the max supported batch size
     builder->setMaxBatchSize(m_options.maxBatchSize);
-
+    std::cout << "setMaxBatchSize" << std::endl;
     // Define an explicit batch size and then create the network.
     // More info here: https://docs.nvidia.com/deeplearning/tensorrt/developer-guide/index.html#explicit-implicit-batch
     auto explicitBatch = 1U << static_cast<uint32_t>(NetworkDefinitionCreationFlag::kEXPLICIT_BATCH);
@@ -50,30 +50,31 @@ bool Engine::build(std::string onnxModelPath) {
     if (!network) {
         return false;
     }
-
+    std::cout << "created network v2" << std::endl;
     // Create a parser for reading the onnx file.
     auto parser = std::unique_ptr<nvonnxparser::IParser>(nvonnxparser::createParser(*network, m_logger));
     if (!parser) {
         return false;
     }
-
+    std::cout << "parser for reading the onnx file" << std::endl;
     // We are going to first read the onnx file into memory, then pass that buffer to the parser.
     // Had our onnx model file been encrypted, this approach would allow us to first decrypt the buffer.
 
-    std::ifstream file(onnxModelPath, std::ios::binary | std::ios::ate);
+    std::ifstream file(onnxModelPath, std::ios::binary);
+    file.seekg(0, std::ios::end);
     std::streamsize size = file.tellg();
     file.seekg(0, std::ios::beg);
-
+    std::cout << "size : " << size << std::endl;
     std::vector<char> buffer(size);
     if (!file.read(buffer.data(), size)) {
         throw std::runtime_error("Unable to read engine file");
     }
-
     auto parsed = parser->parse(buffer.data(), buffer.size());
     if (!parsed) {
         return false;
     }
 
+    std::cout << "save input height width and channel" << std::endl;
     // Save the input height, width, and channels.
     // Require this info for inference.
     const auto input = network->getInput(0);
@@ -83,12 +84,14 @@ bool Engine::build(std::string onnxModelPath) {
   int32_t inputC = inputDims.d[1];
   int32_t inputH = inputDims.d[2];
   int32_t inputW = inputDims.d[3];
-
+    
+    std::cout << "create builder config" << std::endl;
     auto config = std::unique_ptr<nvinfer1::IBuilderConfig>(builder->createBuilderConfig());
     if (!config) {
         return false;
     }
-
+    
+    std::cout << "Specify the optimization profiles" << std::endl;
     // Specify the optimization profiles and the
     IOptimizationProfile* defaultProfile = builder->createOptimizationProfile();
     defaultProfile->setDimensions(inputName, OptProfileSelector::kMIN, Dims4(1, inputC, inputH, inputW));
@@ -112,7 +115,7 @@ bool Engine::build(std::string onnxModelPath) {
         profile->setDimensions(inputName, OptProfileSelector::kMAX, Dims4(m_options.maxBatchSize, inputC, inputH, inputW));
         config->addOptimizationProfile(profile);
     }
-
+    
     config->setMaxWorkspaceSize(m_options.maxWorkspaceSize);
 
     if (m_options.FP16) {
@@ -125,13 +128,15 @@ bool Engine::build(std::string onnxModelPath) {
         return false;
     }
     config->setProfileStream(*profileStream);
-
+    
+    std::cout << "build the engine" << std::endl;
     // Build the engine
     std::unique_ptr<IHostMemory> plan{builder->buildSerializedNetwork(*network, *config)};
     if (!plan) {
         return false;
     }
-
+    
+    std::cout << "write the engine to disk" << std::endl;
     // Write the engine to disk
     std::ofstream outfile(m_engineName, std::ofstream::binary);
     outfile.write(reinterpret_cast<const char*>(plan->data()), plan->size());
@@ -149,7 +154,8 @@ Engine::~Engine() {
 
 bool Engine::loadNetwork() {
     // Read the serialized model from disk
-    std::ifstream file("./best.engine", std::ios::binary | std::ios::ate);
+    std::ifstream file(m_engineName, std::ios::binary | std::ios::ate);
+    file.seekg(0, std::ios::end);
     std::streamsize size = file.tellg();
     file.seekg(0, std::ios::beg);
 
@@ -187,13 +193,23 @@ bool Engine::loadNetwork() {
     if (cudaRet != 0) {
         throw std::runtime_error("Unable to create cuda stream");
     }
+    
+    std::cout << m_engine->getNbBindings() << std::endl;
+    for (int i = 0; i < m_engine->getNbBindings(); ++i){
+      std::cout << m_engine->getBindingName(i) << std::endl;
+      std::cout << m_engine->getBindingDimensions(i) << std::endl;
+      //std::cout << m_engine->isShapeBinding(i) << std::endl;
+      //std::cout << m_engine->getProfileShapeValues(0, i, OptProfileSelector::kMIN);
+    }
 
     return true;
 }
 
 bool Engine::runInference(const std::vector<cv::Mat> &inputFaceChips, std::vector<std::vector<float>>& featureVectors) {
     auto dims = m_engine->getBindingDimensions(0);
+
     auto outputL = m_engine->getBindingDimensions(1).d[1];
+    std::cout << outputL << std::endl;
    
     Dims4 inputDims = {static_cast<int32_t>(dims.d[0]), dims.d[1], dims.d[2], dims.d[3]};
     //Trying to fix this issue where output is not the good size (since yolo take (1,3,640,640)
@@ -207,7 +223,7 @@ bool Engine::runInference(const std::vector<cv::Mat> &inputFaceChips, std::vecto
     auto batchSize = static_cast<int32_t>(inputFaceChips.size());
     // Only reallocate buffers if the batch size has changed
     if (m_prevBatchSize != inputFaceChips.size()) {
-
+        std::cout <<batchSize << std::endl;
         m_inputBuff.hostBuffer.resize(inputDims);
         m_inputBuff.deviceBuffer.resize(inputDims);
 
@@ -221,31 +237,49 @@ bool Engine::runInference(const std::vector<cv::Mat> &inputFaceChips, std::vecto
 
     auto* hostDataBuffer = static_cast<float*>(m_inputBuff.hostBuffer.data());
     
-    
+
     for (size_t batch = 0; batch < inputFaceChips.size(); ++batch) {
         auto image = inputFaceChips[batch];
         
-        // Preprocess code
         image.convertTo(image, CV_32FC3, 1.f / 255.f);
-        cv::subtract(image, cv::Scalar(0.5f, 0.5f, 0.5f), image, cv::noArray(), -1);
-        cv::divide(image, cv::Scalar(0.5f, 0.5f, 0.5f), image, 1, -1);
+        //cv::subtract(image, cv::Scalar(0.485f, 0.456f, 0.406f), image, cv::noArray(), -1);
+        cv::divide(image, cv::Scalar(0.229f, 0.224f, 0.225f), image, 1, -1);
+       
+        //cv::subtract(image, cv::Scalar(0.5f, 0.5f, 0.5f), image, cv::noArray(), -1);
+        //cv::divide(image, cv::Scalar(0.5f, 0.5f, 0.5f), image, 1, -1);
+        /*int i = 0;
+        for (int row = 0; row < image.rows; ++row){
+            for (int col = 0; col < image.cols; ++col){
+                hostDataBuffer[i] = image.at<cv::Vec3f>(row, col)[0];
+                hostDataBuffer[i + dims.d[2] * dims.d[3]] = image.at<cv::Vec3f>(row, col)[1];
+                hostDataBuffer[i + 2 * dims.d[2] * dims.d[3]] = image.at<cv::Vec3f>(row, col)[2];
+                ++i;
+            }
+        }*/
 
+        
         // NHWC to NCHW conversion
         // NHWC: For each pixel, its 3 colors are stored together in RGB order.
         // For a 3 channel image, say RGB, pixels of the R channel are stored first, then the G channel and finally the B channel.
         // https://user-images.githubusercontent.com/20233731/85104458-3928a100-b23b-11ea-9e7e-95da726fef92.png
         int offset = dims.d[1] * dims.d[2] * dims.d[3] * batch;
+
+        std::cout << "batch"<< batch << std::endl;
         int r = 0 , g = 0, b = 0;
         for (int i = 0; i < dims.d[1] * dims.d[2] * dims.d[3]; ++i) {
             if (i % 3 == 0) {
-                hostDataBuffer[offset + r++] = *(reinterpret_cast<float*>(image.data) + i);
+               hostDataBuffer[offset + r++] = *(reinterpret_cast<float*>(image.data) + i);
             } else if (i % 3 == 1) {
                 hostDataBuffer[offset + g++ + dims.d[2]*dims.d[3]] = *(reinterpret_cast<float*>(image.data) + i);
             } else {
-                hostDataBuffer[offset + b++ + dims.d[2]*dims.d[3]*2] = *(reinterpret_cast<float*>(image.data) + i);
-            }
+               hostDataBuffer[offset + b++ + dims.d[2]*dims.d[3]*2] = *(reinterpret_cast<float*>(image.data) + i);
+            }        
         }
+        
+    
     }
+
+    
     
 
     // Copy from CPU to GPU
@@ -253,16 +287,26 @@ bool Engine::runInference(const std::vector<cv::Mat> &inputFaceChips, std::vecto
     if (ret != 0) {
         return false;
     }
-
-    std::vector<void*> predicitonBindings = {m_inputBuff.deviceBuffer.data(), m_outputBuff.deviceBuffer.data()};
-
-    // Run inference.
-    bool status = m_context->enqueueV2(predicitonBindings.data(), m_cudaStream, nullptr);
-    if (!status) {
+    ret = cudaStreamSynchronize(m_cudaStream);
+    if (ret != 0) {
+        std::cout << "Unable to synchronize cuda stream" << std::endl;
         return false;
     }
     
+    std::vector<void*> predictionBindings = {m_inputBuff.deviceBuffer.data(), m_outputBuff.deviceBuffer.data()};
 
+    // Run inference.
+    bool status = m_context->enqueueV2(predictionBindings.data(), m_cudaStream, nullptr);
+    //bool status = m_context->executeV2(predictionBindings.data());
+    if (!status) {
+        return false;
+    }
+
+ ret = cudaStreamSynchronize(m_cudaStream);
+    if (ret != 0) {
+        std::cout << "Unable to synchronize cuda stream" << std::endl;
+        return false;
+    }
     // Copy the results back to CPU memory
     ret = cudaMemcpyAsync(m_outputBuff.hostBuffer.data(), m_outputBuff.deviceBuffer.data(), m_outputBuff.deviceBuffer.nbBytes(), cudaMemcpyDeviceToHost, m_cudaStream);
     if (ret != 0) {
@@ -285,7 +329,7 @@ bool Engine::runInference(const std::vector<cv::Mat> &inputFaceChips, std::vecto
         batch * outputL * sizeof(float), outputL * sizeof(float ));
         featureVectors.emplace_back(std::move(featureVector));
     }
-
+    
     return true;
 }
 
